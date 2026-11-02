@@ -456,6 +456,12 @@ func TestQuicCIDRefusedPreservesSelectors(t *testing.T) {
 		args := &LbArgs{externalIP: "192.0.2.100", endpointIPs: []string{"198.51.100.21"}, sel: selector, quicLb: q}
 		for _, port := range svc.Spec.Ports {
 			model, err := m.makeLoxiLoadBalancerModel(args, svc, port)
+			if selector == api.LbSelN3 {
+				if err == nil {
+					t.Fatal("legacy n3 emitted the reserved QUIC CID wire value")
+				}
+				continue
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -463,6 +469,107 @@ func TestQuicCIDRefusedPreservesSelectors(t *testing.T) {
 				t.Fatalf("fallback changed selector %d: %+v", selector, model.Service)
 			}
 		}
+	}
+}
+
+func TestQuicCIDN3ReconcileRefused(t *testing.T) {
+	for _, protocol := range []corev1.Protocol{corev1.ProtocolUDP, corev1.ProtocolTCP} {
+		for _, policy := range []string{"absent", "enabled", "refused"} {
+			for _, existing := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/existing=%t", protocol, policy, existing), func(t *testing.T) {
+					m, svc, _, f := quicReconcileFixture(t)
+					for _, port := range svc.Spec.Ports {
+						if port.Protocol == protocol {
+							svc.Spec.Ports = []corev1.ServicePort{port}
+							break
+						}
+					}
+					delete(svc.Annotations, quicCIDAnnotation)
+					if existing {
+						if err := m.addLoadBalancer(svc); err != nil {
+							t.Fatal(err)
+						}
+					}
+					beforeCalls, beforeCache := len(f.calls), len(m.lbCache)
+					svc.Annotations[endPointSelAnnotation] = "n3"
+					if policy != "absent" {
+						svc.Annotations[quicCIDAnnotation] = "yes"
+					}
+					if policy == "refused" {
+						svc.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyTypeCluster
+					}
+					for attempt := int32(1); attempt <= 2; attempt++ {
+						err := m.addLoadBalancer(svc)
+						if err == nil || !strings.Contains(err.Error(), "epselect n3") {
+							t.Fatalf("n3 reconcile must fail explicitly: %v", err)
+						}
+						if len(f.calls) != beforeCalls || len(m.lbCache) != beforeCache {
+							t.Fatal("refusal changed LB rules or cache membership")
+						}
+						events, err := m.kubeClient.CoreV1().Events(svc.Namespace).List(context.Background(), metav1.ListOptions{})
+						if err != nil || len(events.Items) != 1 {
+							t.Fatalf("missing aggregated Warning Event: %v %v", events, err)
+						}
+						event := events.Items[0]
+						if event.Type != corev1.EventTypeWarning || event.Reason != quicCIDRefused || event.Count != attempt || !strings.Contains(event.Message, "epselect n3") {
+							t.Fatalf("incorrect refusal Event: %+v", event)
+						}
+					}
+					if existing {
+						model := f.state[strings.ToLower(string(protocol))]
+						if model.Service.Sel != api.LbSelHash || model.Service.QuicLb != nil {
+							t.Fatal("refusal replaced the last working hash rule")
+						}
+					}
+					// Correcting the selector must recover without a controller restart.
+					svc.Annotations[endPointSelAnnotation] = "hash"
+					delete(svc.Annotations, quicCIDAnnotation)
+					if err := m.addLoadBalancer(svc); err != nil {
+						t.Fatal(err)
+					}
+					model, ok := f.state[strings.ToLower(string(protocol))]
+					if !ok || model.Service.Sel != api.LbSelHash || model.Service.QuicLb != nil {
+						t.Fatal("corrected selector did not recover")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestQuicCIDN3EventFailureStillRefused(t *testing.T) {
+	m, svc, _, f := quicReconcileFixture(t)
+	delete(svc.Annotations, quicCIDAnnotation)
+	svc.Annotations[endPointSelAnnotation] = "n3"
+	failed := 0
+	m.kubeClient.(*fake.Clientset).PrependReactor("get", "events", func(ktesting.Action) (bool, runtime.Object, error) {
+		failed++
+		return true, nil, fmt.Errorf("injected Event API failure")
+	})
+	if err := m.addLoadBalancer(svc); err == nil || failed != 1 || len(f.calls) != 0 || len(m.lbCache) != 0 {
+		t.Fatalf("Event API failure bypassed refusal: err=%v failed=%d calls=%v", err, failed, f.calls)
+	}
+}
+
+func TestQuicCIDN2DETWireValueUnchanged(t *testing.T) {
+	if api.LbSelN2DET != 6 {
+		t.Fatal("legacy n2det wire value changed")
+	}
+	m, svc, _, f := quicReconcileFixture(t)
+	delete(svc.Annotations, quicCIDAnnotation)
+	svc.Annotations[endPointSelAnnotation] = "n2det"
+	if err := m.addLoadBalancer(svc); err != nil {
+		t.Fatal(err)
+	}
+	for _, protocol := range []string{"udp", "tcp"} {
+		model, ok := f.state[protocol]
+		if !ok || model.Service.Sel != api.LbSelN2DET || model.Service.QuicLb != nil {
+			t.Fatalf("legacy n2det wire behavior changed for %s: %+v", protocol, model)
+		}
+	}
+	events, err := m.kubeClient.CoreV1().Events(svc.Namespace).List(context.Background(), metav1.ListOptions{})
+	if err != nil || len(events.Items) != 0 {
+		t.Fatalf("n2det unexpectedly warned: %v %v", events, err)
 	}
 }
 

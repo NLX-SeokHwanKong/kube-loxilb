@@ -720,6 +720,14 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 		epSelect = api.LbSelRr
 	}
 
+	// The legacy n3 enum collides with the server's QUIC CID selector.
+	// Refuse before changing cached state or issuing any LB writes.
+	if epSelect == api.LbSelQuicCID {
+		reason := "epselect n3 maps to a selector value the server defines as quic-cid; refusing"
+		m.reportQuicCIDRefusal(svc, reason)
+		return errors.New(reason)
+	}
+
 	cacheKey := GenKey(svc.Namespace, svc.Name)
 	lbCacheEntry, added := m.lbCache[cacheKey]
 
@@ -2060,6 +2068,9 @@ func (m *Manager) makeLoxiLoadBalancerModel(lbArgs *LbArgs, svc *corev1.Service,
 	if port.Protocol == corev1.ProtocolUDP && lbArgs.quicLb != nil {
 		selector = api.LbSelQuicCID
 		quicArg = lbArgs.quicLb
+	}
+	if selector == api.LbSelQuicCID && quicArg == nil {
+		return api.LoadBalancerModel{}, errors.New("quic-cid selector requires a policy-approved UDP quicLb argument")
 	}
 	return api.LoadBalancerModel{
 		Service: api.LoadBalancerService{
