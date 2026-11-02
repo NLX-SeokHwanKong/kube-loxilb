@@ -10,6 +10,9 @@ apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: kube-loxilb-south
 rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "create", "update"]
   - apiGroups:
       - ""
     resources:
