@@ -27,6 +27,14 @@ const (
 	LbSelN3
 )
 
+// LbSelQuicCID is the server wire value; do not renumber legacy selectors.
+const LbSelQuicCID EpSelect = 7
+
+type QuicLbArg struct {
+	SidLen uint8 `json:"sidLen"`
+	Cr     uint8 `json:"cr"`
+}
+
 type LbMode int32
 
 const (
@@ -133,6 +141,7 @@ func (lbModel *LoadBalancerModel) GetKeyStruct() LoxiModel {
 }
 
 type LoadBalancerService struct {
+	QuicLb          *QuicLbArg          `json:"quicLb,omitempty"`
 	ExternalIP      string              `json:"externalIP" key:"externalipaddress"`
 	PrivateIP       string              `json:"privateIP" key:"privateipaddress"`
 	Port            uint16              `json:"port" key:"port"`
@@ -240,6 +249,17 @@ func (l *LoadBalancerAPI) Create(ctx context.Context, lbModel LoxiModel) error {
 }
 
 func (l *LoadBalancerAPI) Delete(ctx context.Context, lbModel LoxiModel) error {
+	return l.delete(ctx, lbModel, false)
+}
+
+// DeleteIfPresent is used while replacing CID rules across Service ports or
+// clients. Only the server's explicit missing-rule response is idempotent;
+// routing, authentication and other errors must still abort the replacement.
+func (l *LoadBalancerAPI) DeleteIfPresent(ctx context.Context, lbModel LoxiModel) error {
+	return l.delete(ctx, lbModel, true)
+}
+
+func (l *LoadBalancerAPI) delete(ctx context.Context, lbModel LoxiModel, missingOK bool) error {
 	subresources, err := l.MakeDeletedSubResource(l.deleteKey, lbModel)
 	if err != nil {
 		return err
@@ -251,6 +271,13 @@ func (l *LoadBalancerAPI) Delete(ctx context.Context, lbModel LoxiModel) error {
 	}
 
 	resp := l.client.DELETE(l.resource).SubResource(subresources).Query(queryParam).Body(lbModel).Do(ctx)
+	if missingOK {
+		if resp.statusCode == http.StatusNotFound && resp.err != nil && resp.err.Error() == "no-rule error" {
+			return nil
+		}
+		return resp.err
+	}
+
 	if resp.statusCode != http.StatusOK {
 		if resp.err != nil {
 			return resp.err
