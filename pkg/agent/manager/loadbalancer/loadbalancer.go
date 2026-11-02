@@ -130,6 +130,7 @@ type Manager struct {
 }
 
 type LbArgs struct {
+	quicLb              *api.QuicLbArg
 	externalIP          string
 	privateIP           string
 	livenessCheck       bool
@@ -169,27 +170,29 @@ type LbServicePairEntry struct {
 }
 
 type LbCacheEntry struct {
-	LbMode         int
-	Timeout        int
-	ActCheck       bool
-	PrefLocal      bool
-	ppv2En         bool
-	egress         bool
-	Inst           string
-	Addr           string
-	State          string
-	NodeLabel      string
-	ProbeType      string
-	ProbePort      uint16
-	ProbeReq       string
-	ProbeResp      string
-	ProbeTimeo     uint32
-	ProbeRetries   int
-	EpSelect       api.EpSelect
-	IPPool         *ippool.IPPool
-	SIPPools       []*ippool.IPPool
-	SecIPs         []string
-	LbServicePairs map[string]*LbServicePairEntry
+	QuicCIDConfig    string
+	quicCIDReplacing bool
+	LbMode           int
+	Timeout          int
+	ActCheck         bool
+	PrefLocal        bool
+	ppv2En           bool
+	egress           bool
+	Inst             string
+	Addr             string
+	State            string
+	NodeLabel        string
+	ProbeType        string
+	ProbePort        uint16
+	ProbeReq         string
+	ProbeResp        string
+	ProbeTimeo       uint32
+	ProbeRetries     int
+	EpSelect         api.EpSelect
+	IPPool           *ippool.IPPool
+	SIPPools         []*ippool.IPPool
+	SecIPs           []string
+	LbServicePairs   map[string]*LbServicePairEntry
 }
 
 type LbCacheTable map[string]*LbCacheEntry
@@ -728,6 +731,15 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 		}
 	}
 
+	quicArg, quicReason := m.quicCIDPolicy(svc, usePodNet, useExternalEndpoint, needMultusEP, addrType, lbMode, enProxyProtov2, isEgress, endpointIPs)
+	if quicReason != "" {
+		m.reportQuicCIDRefusal(svc, quicReason)
+	}
+	quicKey := ""
+	if quicArg != nil {
+		quicKey = fmt.Sprintf("4/%d", quicArg.Cr)
+	}
+
 	if !added {
 		if len(endpointIPs) <= 0 {
 			return errors.New("no active endpoints")
@@ -933,6 +945,14 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 		klog.Infof("%s: ProbeRetries update", cacheKey)
 	}
 
+	quicChanged := quicKey != m.lbCache[cacheKey].QuicCIDConfig || m.lbCache[cacheKey].quicCIDReplacing
+	if quicChanged {
+		update = true
+		if added {
+			needDelete = true
+		}
+	}
+
 	if epSelect != m.lbCache[cacheKey].EpSelect {
 		m.lbCache[cacheKey].EpSelect = epSelect
 		update = true
@@ -1001,8 +1021,18 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 		ingSvcPairs = nil
 		return nil
 	} else {
+		if quicChanged {
+			// Initial CID installs also stay pending if one Service port fails
+			// and the annotation changes before the queued retry runs.
+			m.lbCache[cacheKey].quicCIDReplacing = true
+		}
 		if needDelete {
-			m.deleteLoadBalancer(svc.Namespace, svc.Name, false)
+			deleteErr := m.deleteLoadBalancerRules(svc.Namespace, svc.Name, false, quicChanged)
+			if deleteErr != nil && quicChanged {
+				// Keep the old CID configuration pending until every rule is
+				// replaced successfully; a failed removal must be retried.
+				return errors.Wrap(deleteErr, "replace quic-cid loadBalancer")
+			}
 		}
 		if added {
 			for _, sp := range m.lbCache[cacheKey].LbServicePairs {
@@ -1045,6 +1075,7 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 			probeTimeo:          m.lbCache[cacheKey].ProbeTimeo,
 			probeRetries:        m.lbCache[cacheKey].ProbeRetries,
 			sel:                 m.lbCache[cacheKey].EpSelect,
+			quicLb:              quicArg,
 			inst:                m.lbCache[cacheKey].Inst,
 			ppv2En:              m.lbCache[cacheKey].ppv2En,
 			egress:              m.lbCache[cacheKey].egress,
@@ -1102,6 +1133,11 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 		sp.LbModelList = append(sp.LbModelList, lbModel)
 		m.lbCache[cacheKey].LbServicePairs[GenSPKey(sp.ExternalIP, sp.Port, sp.Protocol)] = &sp
 	}
+
+	// Commit the effective CID configuration only after all Service ports have
+	// been installed. In particular, a partial TCP/UDP install must retry.
+	m.lbCache[cacheKey].QuicCIDConfig = quicKey
+	m.lbCache[cacheKey].quicCIDReplacing = false
 
 	// Update service.Status.LoadBalancer.Ingress
 	for retry := 0; retry < 5; retry++ {
@@ -1206,6 +1242,12 @@ func (m *Manager) updateAllLoxiLBServiceStatus() error {
 }
 
 func (m *Manager) deleteLoadBalancer(ns, name string, releaseAll bool) error {
+	entry := m.lbCache[GenKey(ns, name)]
+	pendingCID := entry != nil && entry.quicCIDReplacing
+	return m.deleteLoadBalancerRules(ns, name, releaseAll, pendingCID)
+}
+
+func (m *Manager) deleteLoadBalancerRules(ns, name string, releaseAll, cidTransition bool) error {
 	cacheKey := GenKey(ns, name)
 	lbEntry, ok := m.lbCache[cacheKey]
 	if !ok {
@@ -1213,11 +1255,11 @@ func (m *Manager) deleteLoadBalancer(ns, name string, releaseAll bool) error {
 		return nil
 	}
 
-	var rErr error
-	isError := false
 	ipPool := lbEntry.IPPool
 	sipPools := lbEntry.SIPPools
 
+	var rErr error
+	isError := false
 	for _, sp := range lbEntry.LbServicePairs {
 		var errChList []chan error
 		for _, lb := range sp.LbModelList {
@@ -1230,6 +1272,10 @@ func (m *Manager) deleteLoadBalancer(ns, name string, releaseAll bool) error {
 					if m.networkConfig.AppendEPs {
 						lbModel.Service.Oper = api.LBOPDetach
 						ch <- client.LoadBalancer().Create(context.Background(), &lbModel)
+					} else if cidTransition {
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer cancel()
+						ch <- client.LoadBalancer().DeleteIfPresent(ctx, &lbModel)
 					} else {
 						ch <- client.LoadBalancer().Delete(context.Background(), &lbModel)
 					}
@@ -1244,7 +1290,9 @@ func (m *Manager) deleteLoadBalancer(ns, name string, releaseAll bool) error {
 			if err != nil {
 				isError = true
 				rErr = err
-				break
+				if !cidTransition {
+					break
+				}
 			}
 		}
 	}
@@ -2007,6 +2055,12 @@ func (m *Manager) makeLoxiLoadBalancerModel(lbArgs *LbArgs, svc *corev1.Service,
 		}
 	}
 
+	selector := lbArgs.sel
+	var quicArg *api.QuicLbArg
+	if port.Protocol == corev1.ProtocolUDP && lbArgs.quicLb != nil {
+		selector = api.LbSelQuicCID
+		quicArg = lbArgs.quicLb
+	}
 	return api.LoadBalancerModel{
 		Service: api.LoadBalancerService{
 			ExternalIP:   lbArgs.externalIP,
@@ -2027,7 +2081,8 @@ func (m *Manager) makeLoxiLoadBalancerModel(lbArgs *LbArgs, svc *corev1.Service,
 			ProbeRetries: int32(lbArgs.probeRetries),
 			PpV2:         lbArgs.ppv2En,
 			Egress:       lbArgs.egress,
-			Sel:          lbArgs.sel,
+			Sel:          selector,
+			QuicLb:       quicArg,
 			Name:         fmt.Sprintf("%s_%s:%s", svc.Namespace, svc.Name, lbArgs.inst),
 			MtlsFrontend: lbArgs.mtlsFrontend,
 			MtlsBackend:  lbArgs.mtlsBackend,
